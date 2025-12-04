@@ -1,7 +1,7 @@
 [project]
-name = "vm-sniper"
+name = "gpu-sniper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Simple script to snipe available GPU instances on GCP."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
