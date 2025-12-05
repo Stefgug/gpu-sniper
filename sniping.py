@@ -1,45 +1,66 @@
-import subprocess
+import os
 import json
-import time
+import random
+import subprocess
 import sys
 import threading
+import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import random
 
 # --- CONFIGURATION ---
-PROJECT_ID = "PROJECT ID"      # Votre ID projet
+PROJECT_ID = "PROJECT ID"      # Default GCP project
 INSTANCE_NAME_BASE = "gpu-worker"
-REGION_FILTER = "europe"           # Filtre géographique
-MAX_RETRIES = -1                   # -1 = infini
-RETRY_DELAY = 120                  # 2 minutes de pause entre les vagues
-MAX_WORKERS = 6                    # Nombre de tentatives simultanées
+REGION_FILTER = "europe"           # Restrict discovery to matching regions
+MAX_RETRIES = -1                   # -1 means endless attempts
+RETRY_DELAY = 120                  # Pause in seconds between waves
+MAX_WORKERS = 6                    # Concurrent attempts
 
-# Mapping GPU -> Machine Type requis
+# GPU model -> machine type mapping
 GPU_CONFIG = {
     "nvidia-tesla-t4": "n1-standard-4",
     "nvidia-l4": "g2-standard-4"
 }
 
-# Variables globales pour la gestion du parallélisme
+# Globals used for coordination across threads
 stop_event = threading.Event()
 print_lock = threading.Lock()
 
-def log(msg):
-    """Affiche un message de manière thread-safe."""
+# Copy current environment and ensure gcloud sees the desired project
+GCLOUD_ENV = os.environ.copy()
+GCLOUD_ENV.setdefault("CLOUDSDK_CORE_PROJECT", PROJECT_ID)
+
+def log(msg: str) -> None:
+    """Thread-safe stdout logging."""
     with print_lock:
         print(msg)
 
-def run_gcloud_json(cmd_list):
-    """Exécute gcloud et retourne le JSON, gère les erreurs silencieusement pour l'init."""
+def run_gcloud_json(cmd_list: Sequence[str]) -> list[dict]:
+    """Execute gcloud and return parsed JSON, swallowing errors for discovery."""
     try:
-        cmd_list = cmd_list + ["--format=json"]
-        result = subprocess.run(cmd_list, capture_output=True, text=True, check=True)
+        cmd = list(cmd_list) + ["--format=json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=GCLOUD_ENV)
         return json.loads(result.stdout)
     except subprocess.CalledProcessError:
         return []
 
+def warn_if_project_mismatch():
+    """Warn when the active gcloud configuration points to another project."""
+    cmd = ["gcloud", "config", "get-value", "project"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=GCLOUD_ENV)
+        current = result.stdout.strip()
+        if current in {"", "(unset)"}:
+            log(f"⚠️ No active gcloud project. Forcing {PROJECT_ID} via CLOUDSDK_CORE_PROJECT. Consider running `gcloud config set project {PROJECT_ID}`.")
+        elif current != PROJECT_ID:
+            log(f"⚠️ Active gcloud project '{current}' differs. Overriding locally to {PROJECT_ID}. Run `gcloud config set project {PROJECT_ID}` to persist.")
+    except FileNotFoundError as exc:
+        log(f"⚠️ gcloud executable not found in PATH: {exc}")
+    except subprocess.CalledProcessError as exc:
+        log(f"⚠️ Unable to read gcloud project: {exc.stderr.strip() if exc.stderr else exc}")
+
 def get_zones_for_gpu(gpu_type):
-    """Récupère les zones valides et nettoie les URLs pour n'avoir que le nom court."""
+    """Return zones supporting the GPU while stripping long resource URLs."""
     cmd = [
         "gcloud", "compute", "accelerator-types", "list",
         f"--project={PROJECT_ID}",
@@ -47,27 +68,18 @@ def get_zones_for_gpu(gpu_type):
     ]
     data = run_gcloud_json(cmd)
 
-    # CORRECTION MAJEURE : On extrait juste le nom de la zone (ex: 'europe-west1-b')
-    # au lieu de l'URL complète ('https://.../europe-west1-b') qui fait planter gcloud create.
-    zones = []
-    for item in data:
-        if 'zone' in item:
-            raw_zone = item['zone']
-            short_zone = raw_zone.split('/')[-1] # Garde tout ce qui est après le dernier '/'
-            zones.append(short_zone)
-
-    return sorted(list(set(zones)))
+    zones = [item["zone"].split("/")[-1] for item in data if "zone" in item]
+    return sorted(set(zones))
 
 def create_vm(zone, gpu_type):
-    """Tente de créer la VM. S'arrête immédiatement si une autre a réussi."""
+    """Attempt a VM creation, aborting if another worker already succeeded."""
     if stop_event.is_set():
         return False
 
     machine_type = GPU_CONFIG[gpu_type]
-    # Nom unique pour éviter les collisions : gpu-worker-t4-europe-west1-b
     instance_name = f"{INSTANCE_NAME_BASE}-{gpu_type.split('-')[-1]}-{zone}"
 
-    log(f"🚀 [Start] Tentative {gpu_type} sur {zone}...")
+    log(f"[Start] Attempting {gpu_type} in {zone}...")
 
     cmd = [
         "gcloud", "compute", "instances", "create", instance_name,
@@ -82,80 +94,79 @@ def create_vm(zone, gpu_type):
         "--quiet"
     ]
 
-    # Exécution de la commande
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=GCLOUD_ENV)
 
-    # Vérification post-exécution (au cas où quelqu'un a gagné pendant qu'on attendait Google)
     if stop_event.is_set():
         return False
 
     if result.returncode == 0:
-        stop_event.set() # On signale à tout le monde d'arrêter
-        log(f"\n✅✅✅ VICTOIRE ! GPU trouvé : {gpu_type} dans {zone}")
-        log(f"💻 SSH : gcloud compute ssh {instance_name} --zone={zone}")
+        stop_event.set()
+        log(f"\n[SUCCESS] GPU {gpu_type} available in {zone}.")
+        log(f"[SSH] gcloud compute ssh {instance_name} --zone={zone}")
         return True
     else:
-        # Analyse des erreurs pour le feedback
         err = result.stderr
         if "resources" in err or "exhausted" in err or "not available" in err:
-            log(f"🔻 [Fail] {zone} ({gpu_type}): Stock épuisé.")
+            log(f"[Fail] {zone} ({gpu_type}): capacity exhausted.")
         elif "quota" in err.lower():
-            log(f"❌ [Fail] {zone} ({gpu_type}): Erreur Quota (Vérifiez votre console !).")
+            log(f"[Fail] {zone} ({gpu_type}): quota error, review the console.")
         elif "invalid" in err.lower() or "not found" in err.lower():
-            # Erreur de syntaxe ou de zone invalide (ne devrait plus arriver avec le fix)
-            log(f"⚠️ [Error] {zone}: {err.strip().splitlines()[-1]}")
+            log(f"[Error] {zone}: {err.strip().splitlines()[-1]}")
         else:
-            # Erreurs obscures
-            pass
+            log(f"[Fail] {zone} ({gpu_type}): {err.strip() or 'Unexpected error.'}")
         return False
 
 def main():
     attempt_count = 0
 
-    # 1. Découverte des zones (séquentiel)
-    log("🔍 Cartographie des zones disponibles (avec nettoyage des noms)...")
+    warn_if_project_mismatch()
+
+    log("[Init] Discovering eligible zones...")
     tasks = []
-    for gpu_type in GPU_CONFIG.keys():
+    for gpu_type in GPU_CONFIG:
         zones = get_zones_for_gpu(gpu_type)
-        log(f"   -> {gpu_type} détecté dans {len(zones)} zones.")
-        for z in zones:
-            tasks.append((z, gpu_type))
+        log(f"   {gpu_type}: {len(zones)} zone(s) detected.")
+        tasks.extend((z, gpu_type) for z in zones)
 
     if not tasks:
-        log("❌ Aucune zone trouvée. Vérifiez le PROJECT_ID ou vos droits.")
+        log("[Error] No zones found. Verify PROJECT_ID or IAM permissions.")
         sys.exit(1)
 
-    log(f"🎯 Total combinaisons à tester : {len(tasks)}")
+    log(f"[Init] Total combinations to test: {len(tasks)}")
 
-    # 2. Boucle principale de sniping
     while not stop_event.is_set():
         attempt_count += 1
-        log(f"\n🏁 --- PASSE N°{attempt_count} (Workers: {MAX_WORKERS}) ---")
+        log(f"\n[Wave {attempt_count}] Running with {MAX_WORKERS} workers...")
 
-        # Mélanger pour répartir la charge et la chance
         random.shuffle(tasks)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
             for zone, gpu in tasks:
-                if stop_event.is_set(): break
+                if stop_event.is_set():
+                    break
                 futures.append(executor.submit(create_vm, zone, gpu))
 
-            # On attend que ce batch finisse
             for f in as_completed(futures):
-                if stop_event.is_set():
+                try:
+                    f.result()
+                except FileNotFoundError as exc:
+                    log(f"[Error] gcloud not found (PATH issue?): {exc}")
+                    stop_event.set()
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
+                except Exception as exc:
+                    log(f"[Error] Worker crashed: {exc}")
 
         if stop_event.is_set():
             break
 
         if MAX_RETRIES != -1 and attempt_count >= MAX_RETRIES:
-            log("\n❌ Echec : Aucun GPU trouvé après le nombre max de tentatives.")
+            log("\n[Stop] No GPU found before reaching the retry limit.")
             break
 
         if not stop_event.is_set():
-            log(f"\n💤 Pause de {RETRY_DELAY}s avant nouvelle vague...")
+            log(f"\n[Sleep] Waiting {RETRY_DELAY}s before the next wave...")
             time.sleep(RETRY_DELAY)
 
 if __name__ == "__main__":
