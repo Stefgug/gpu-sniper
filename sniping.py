@@ -91,6 +91,7 @@ def create_vm(zone, gpu_type):
         "--image-family=pytorch-2-7-cu128-ubuntu-2204-nvidia-570",
         "--image-project=deeplearning-platform-release",
         "--boot-disk-size=200GB",
+        "--scopes=cloud-platform",
         "--quiet"
     ]
 
