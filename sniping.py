@@ -15,6 +15,8 @@ REGION_FILTER = "europe"           # Restrict discovery to matching regions
 MAX_RETRIES = -1                   # -1 means endless attempts
 RETRY_DELAY = 120                  # Pause in seconds between waves
 MAX_WORKERS = 6                    # Concurrent attempts
+IMAGE_FAMILY = "pytorch-2-7-cu128-ubuntu-2204-nvidia-570"
+IMAGE_PROJECT = "deeplearning-platform-release"
 
 # GPU model -> machine type mapping
 GPU_CONFIG = {
@@ -88,8 +90,8 @@ def create_vm(zone, gpu_type):
         f"--machine-type={machine_type}",
         f"--accelerator=type={gpu_type},count=1",
         "--maintenance-policy=TERMINATE",
-        "--image-family=pytorch-2-7-cu128-ubuntu-2204-nvidia-570",
-        "--image-project=deeplearning-platform-release",
+        f"--image-family={IMAGE_FAMILY}",
+        f"--image-project={IMAGE_PROJECT}",
         "--boot-disk-size=200GB",
         "--scopes=cloud-platform",
         "--quiet"
