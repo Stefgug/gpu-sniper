@@ -9,14 +9,14 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- CONFIGURATION ---
-PROJECT_ID = "PROJECT ID"      # Default GCP project
+PROJECT_ID = "PROJECT-ID"      # Default GCP project
 INSTANCE_NAME_BASE = "gpu-worker"
 REGION_FILTER = "europe"           # Restrict discovery to matching regions
 MAX_RETRIES = -1                   # -1 means endless attempts
 RETRY_DELAY = 120                  # Pause in seconds between waves
 MAX_WORKERS = 6                    # Concurrent attempts
-IMAGE_FAMILY = "pytorch-2-7-cu128-ubuntu-2204-nvidia-570"
-IMAGE_PROJECT = "deeplearning-platform-release"
+IMAGE_FAMILY = "tf-2-16-gpu-debian-11-py310-conda"
+IMAGE_PROJECT = "ml-images"
 
 # GPU model -> machine type mapping
 GPU_CONFIG = {
